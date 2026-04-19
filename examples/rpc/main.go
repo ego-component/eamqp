@@ -1,127 +1,147 @@
-// rpc example demonstrates RPC-style communication over RabbitMQ.
+// rpc demonstrates RPC-style request/response over RabbitMQ using the Direct Reply-To
+// pattern. The client creates an exclusive reply queue for each RPC call, and the
+// server publishes the response through the exchange with the correlation ID.
+//
+// Key concepts:
+//   - CorrelationId: links request and response
+//   - ReplyTo: tells the server which queue to reply to
+//   - Exclusive reply queue: auto-deleted when client disconnects
+//
+// Usage:
+//
+//	go run ./examples/rpc --config=examples/config/local.toml
+//
+// The server starts in a goroutine and processes 5 concurrent RPC calls.
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
-	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/ego-component/eamqp"
+	"github.com/ego-component/eamqp/examples/internal/exampleconfig"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 const (
-	exchange   = "rpc.exchange"
-	rpcQueue   = "rpc.queue"
-	replyQueue = "rpc.reply"
+	exchange = "rpc.exchange"
+	rpcQueue = "rpc.queue"
 )
 
 func main() {
-	// Create client.
-	client, err := eamqp.New(eamqp.Config{
-		Addr: getAddr(),
-	})
+	client, err := exampleconfig.LoadClient(exampleconfig.DefaultComponentKey)
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
 	defer client.Close()
 
-	// Create RPC channel.
-	rpcCh, err := client.NewChannel()
+	// Server-side channel: declares exchange, queue, and starts consuming.
+	serverCh, err := client.NewChannel()
 	if err != nil {
-		log.Fatalf("Failed to create channel: %v", err)
+		log.Fatalf("Failed to create server channel: %v", err)
 	}
-	defer rpcCh.Close()
+	defer serverCh.Close()
 
-	// Declare exchange.
-	if err := rpcCh.ExchangeDeclare(exchange, "direct", true, false, false, false, nil); err != nil {
+	if err := serverCh.ExchangeDeclare(exchange, "direct", true, false, false, false, nil); err != nil {
 		log.Fatalf("Failed to declare exchange: %v", err)
 	}
-
-	// Declare RPC queue.
-	_, err = rpcCh.QueueDeclare(rpcQueue, true, false, false, false, nil)
-	if err != nil {
+	if _, err := serverCh.QueueDeclare(rpcQueue, true, false, false, false, nil); err != nil {
 		log.Fatalf("Failed to declare queue: %v", err)
 	}
-
-	// Declare reply queue.
-	replyQ, err := rpcCh.QueueDeclare(replyQueue, true, false, true, false, nil)
-	if err != nil {
-		log.Fatalf("Failed to declare reply queue: %v", err)
-	}
-
-	// Bind RPC queue.
-	if err := rpcCh.QueueBind(rpcQueue, rpcQueue, exchange, false, nil); err != nil {
+	if err := serverCh.QueueBind(rpcQueue, rpcQueue, exchange, false, nil); err != nil {
 		log.Fatalf("Failed to bind queue: %v", err)
 	}
 
 	// Start RPC server.
 	go func() {
-		deliveries, err := rpcCh.Consume(rpcQueue, "", false, false, false, false, nil)
+		deliveries, err := serverCh.Consume(rpcQueue, "", false, false, false, false, nil)
 		if err != nil {
 			log.Fatalf("Failed to start consuming: %v", err)
 		}
 
 		for delivery := range deliveries {
-			// Process request.
 			request := string(delivery.Body)
-			fmt.Printf("RPC Request: %s\n", request)
+			fmt.Printf("Server received: %s\n", request)
 
-			// Generate response.
-			response := fmt.Sprintf(`{"result": "processed %s", "id": %d}`, request, rand.Int())
-
-			// Get reply-to queue.
-			replyTo := delivery.ReplyTo
-			if replyTo == "" {
-				replyTo = replyQ.Name
+			response, err := json.Marshal(struct {
+				Result   string `json:"result"`
+				ServerTS int64  `json:"server_ts"`
+			}{
+				Result:   fmt.Sprintf("processed %s", request),
+				ServerTS: time.Now().Unix(),
+			})
+			if err != nil {
+				log.Printf("Failed to encode response: %v", err)
+				delivery.Nack(false, true)
+				continue
 			}
 
-			// Send response.
-			err = rpcCh.Publish(exchange, replyTo, false, false, amqp.Publishing{
-				ContentType:  "application/json",
-				DeliveryMode: amqp.Persistent,
+			// Publish response through the exchange using the reply-to queue name as routing key.
+			// The reply queue must be bound to the exchange with the same routing key.
+			replyTo := delivery.ReplyTo
+			if replyTo == "" {
+				replyTo = "default.reply"
+			}
+			err = serverCh.Publish(exchange, replyTo, false, false, amqp.Publishing{
+				ContentType:   "application/json",
+				DeliveryMode:  amqp.Persistent,
 				CorrelationId: delivery.CorrelationId,
-				Body:         []byte(response),
+				Body:          response,
 			})
 			if err != nil {
 				log.Printf("Failed to send response: %v", err)
 				delivery.Nack(false, true)
 				continue
 			}
-
 			delivery.Ack(false)
 		}
 	}()
 
-	// Make RPC calls.
+	// Make 5 concurrent RPC calls.
 	var wg sync.WaitGroup
+	var successCount int64
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	for i := 0; i < 5; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 
-			// Create dedicated channel for this RPC.
+			// Each call uses its own channel and exclusive reply queue.
 			ch, err := client.NewChannel()
 			if err != nil {
-				log.Printf("Failed to create channel: %v", err)
+				log.Printf("Call %d: failed to create channel: %v", id, err)
 				return
 			}
 			defer ch.Close()
 
-			// Set up reply consumer.
-			deliveries, err := ch.Consume(replyQ.Name, "", true, false, false, false, nil)
+			// Exclusive reply queue: auto-deleted when this channel closes.
+			replyQ, err := ch.QueueDeclare("", false, true, true, false, nil)
 			if err != nil {
-				log.Printf("Failed to start reply consumer: %v", err)
+				log.Printf("Call %d: failed to declare reply queue: %v", id, err)
+				return
+			}
+			// Bind the exclusive reply queue to the exchange so server can publish to it.
+			if err := ch.QueueBind(replyQ.Name, replyQ.Name, exchange, false, nil); err != nil {
+				log.Printf("Call %d: failed to bind reply queue: %v", id, err)
+				return
+			}
+
+			// Start consuming replies.
+			deliveries, err := ch.Consume(replyQ.Name, "", false, false, false, false, nil)
+			if err != nil {
+				log.Printf("Call %d: failed to start consumer: %v", id, err)
 				return
 			}
 
 			// Send request.
 			request := fmt.Sprintf(`{"request_id": %d, "action": "process"}`, id)
 			correlationId := fmt.Sprintf("corr-%d", id)
-
 			err = ch.Publish(exchange, rpcQueue, false, false, amqp.Publishing{
 				ContentType:   "application/json",
 				DeliveryMode:  amqp.Persistent,
@@ -130,27 +150,29 @@ func main() {
 				Body:          []byte(request),
 			})
 			if err != nil {
-				log.Printf("Failed to send request: %v", err)
+				log.Printf("Call %d: failed to send request: %v", id, err)
 				return
 			}
+			fmt.Printf("Client %d sent: %s\n", id, request)
 
-			// Wait for response.
+			// Wait for response with timeout.
 			select {
-			case delivery := <-deliveries:
-				fmt.Printf("RPC Response [%d]: %s\n", id, string(delivery.Body))
-			case <-time.After(5 * time.Second):
-				fmt.Printf("RPC Response [%d]: timeout\n", id)
+			case delivery, ok := <-deliveries:
+				if !ok {
+					fmt.Printf("Client %d: channel closed\n", id)
+					return
+				}
+				if delivery.CorrelationId == correlationId {
+					fmt.Printf("Client %d received: %s\n", id, string(delivery.Body))
+					atomic.AddInt64(&successCount, 1)
+					delivery.Ack(false)
+				}
+			case <-ctx.Done():
+				fmt.Printf("Client %d: timeout\n", id)
 			}
 		}(i)
 	}
 
 	wg.Wait()
-	fmt.Println("All RPC calls completed")
-}
-
-func getAddr() string {
-	if addr := os.Getenv("AMQP_ADDR"); addr != "" {
-		return addr
-	}
-	return "amqp://guest:guest@localhost:5672/"
+	fmt.Printf("\nRPC complete. Success: %d/5\n", atomic.LoadInt64(&successCount))
 }

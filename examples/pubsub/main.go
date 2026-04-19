@@ -10,15 +10,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ego-component/eamqp"
+	"github.com/ego-component/eamqp/examples/internal/exampleconfig"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 func main() {
-	// Create client.
-	client, err := eamqp.New(eamqp.Config{
-		Addr: getAddr(),
-	})
+	client, err := exampleconfig.LoadClient(exampleconfig.DefaultComponentKey)
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
@@ -103,11 +100,4 @@ func main() {
 			fmt.Printf("Published: %s\n", msg)
 		}
 	}
-}
-
-func getAddr() string {
-	if addr := os.Getenv("AMQP_ADDR"); addr != "" {
-		return addr
-	}
-	return "amqp://guest:guest@localhost:5672/"
 }

@@ -9,14 +9,11 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/ego-component/eamqp"
+	"github.com/ego-component/eamqp/examples/internal/exampleconfig"
 )
 
 func main() {
-	// Create client.
-	client, err := eamqp.New(eamqp.Config{
-		Addr: getAddr(),
-	})
+	client, err := exampleconfig.LoadClient(exampleconfig.DefaultComponentKey)
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
@@ -34,11 +31,20 @@ func main() {
 		log.Fatalf("Failed to set QoS: %v", err)
 	}
 
-	// Declare queue.
-	queue := "consumer.example.queue"
+	// Use the same topology as examples/producer so the two examples can be
+	// run together during local verification.
+	exchange := "producer.example"
+	if err := ch.ExchangeDeclare(exchange, "direct", true, false, false, false, nil); err != nil {
+		log.Fatalf("Failed to declare exchange: %v", err)
+	}
+
+	queue := "producer.example.queue"
 	_, err = ch.QueueDeclare(queue, true, false, false, false, nil)
 	if err != nil {
 		log.Fatalf("Failed to declare queue: %v", err)
+	}
+	if err := ch.QueueBind(queue, "test", exchange, false, nil); err != nil {
+		log.Fatalf("Failed to bind queue: %v", err)
 	}
 
 	// Start consuming (manual ack).
@@ -78,11 +84,4 @@ func main() {
 			}
 		}
 	}
-}
-
-func getAddr() string {
-	if addr := os.Getenv("AMQP_ADDR"); addr != "" {
-		return addr
-	}
-	return "amqp://guest:guest@localhost:5672/"
 }

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -46,6 +47,18 @@ func TestConnectionPoolClose(t *testing.T) {
 	err := pool.Close()
 	assert.NoError(t, err)
 	assert.True(t, pool.IsClosed())
+}
+
+func TestConnectionPoolCloseClosesChannelPools(t *testing.T) {
+	pool := newConnectionPool(&Config{PoolSize: 1}, nil, nil, []amqp.URI{{Scheme: "amqp", Host: "localhost:5672"}})
+	channelPool := &ChannelPool{
+		channels: make(chan *amqp.Channel, 1),
+	}
+	pool.channelPools = []*ChannelPool{channelPool}
+
+	require.NoError(t, pool.Close())
+
+	assert.True(t, channelPool.IsClosed())
 }
 
 func TestConnectionPoolLen(t *testing.T) {

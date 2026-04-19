@@ -2,7 +2,6 @@ package eamqp
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"sync"
 	"time"
@@ -39,15 +38,13 @@ func New(config Config, opts ...Option) (*Client, error) {
 		opt(options)
 	}
 
-	// Setup logger.
-	var log Logger
-	if config.EnableLogger {
+	log := options.Logger
+	if log == nil && config.EnableAccessInterceptor {
 		log = &NopLogger{}
 	}
 
-	// Setup metrics.
-	var metrics MetricsCollector
-	if config.EnableMetrics {
+	metrics := options.Metrics
+	if metrics == nil {
 		metrics = &NoOpMetrics{}
 	}
 
@@ -75,7 +72,7 @@ func (c *Client) dial() error {
 	}
 
 	// Single connection mode.
-	if c.config.PoolSize <= 1 && len(uris) == 1 {
+	if c.config.PoolSize <= 1 && len(uris) == 1 && c.config.ChannelPoolSize <= 0 {
 		conn, err := c.dialConnection(uris[0])
 		if err != nil {
 			return err
@@ -96,50 +93,18 @@ func (c *Client) dial() error {
 
 // dialConnection dials a single connection.
 func (c *Client) dialConnection(uri amqp.URI) (*amqp.Connection, error) {
-	amqpCfg := amqp.Config{
-		Vhost:      uri.Vhost,
-		Heartbeat:  c.config.Heartbeat,
-		ChannelMax: int(c.config.ChannelMax),
-		FrameSize:  c.config.FrameSize,
-		Locale:     c.config.Locale,
-		Properties: amqp.Table{},
+	amqpCfg, err := c.config.buildAmqpConfig(uri, c.opts)
+	if err != nil {
+		return nil, err
 	}
 
-	if c.config.ClientName != "" {
-		amqpCfg.Properties["connection_name"] = c.config.ClientName
-	}
-
-	// Build TLS config.
-	var tlsConfig *tls.Config
-	if c.config.TLSConfig != nil {
-		tlsConfig = c.config.TLSConfig
-	} else if c.config.TLSCertFile != "" {
-		tc, err := c.config.buildTLSConfig(uri.Host)
-		if err != nil {
-			return nil, err
-		}
-		tlsConfig = tc
-	}
-	amqpCfg.TLSClientConfig = tlsConfig
-
-	// SASL auth.
-	if c.config.Username != "" || c.config.Password != "" {
-		amqpCfg.SASL = []amqp.Authentication{
-			&amqp.PlainAuth{
-				Username: c.config.Username,
-				Password: c.config.Password,
-			},
-		}
-	}
-
-	// Dial.
 	conn, err := amqp.DialConfig(uri.String(), amqpCfg)
 	if err != nil {
-		return nil, fmt.Errorf("eamqp: failed to dial %s: %w", uri, err)
+		return nil, fmt.Errorf("eamqp: failed to dial %s: %w", redactAMQPURI(uri.String()), err)
 	}
 
 	if c.logger != nil {
-		c.logger.Info("eamqp connected", "addr", uri.String())
+		c.logger.Info("eamqp connected", "addr", redactAMQPURI(uri.String()))
 	}
 
 	return conn, nil
@@ -213,47 +178,23 @@ func (c *Client) NewChannel() (*Channel, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		amqpCh, release, err := c.pool.AcquireChannel(ctx)
+		amqpCh, release, discard, err := c.pool.AcquireFromPool(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("eamqp: failed to acquire channel: %w", err)
 		}
 
 		c.metrics.RecordChannelAcquired()
 
-		// Apply channel options.
-		if c.opts != nil && c.opts.ChannelOptions != nil {
-			if err := c.opts.ChannelOptions(amqpCh); err != nil {
-				release()
-				return nil, fmt.Errorf("eamqp: channel options failed: %w", err)
-			}
-		}
-
-		wrapped := &ChannelWithRelease{
-			Channel: Channel{amqpCh: amqpCh, client: c},
-			release: release,
-		}
-
-		return &wrapped.Channel, nil
+		return newChannelWithRelease(amqpCh, c, func() {
+			release()
+			c.metrics.RecordChannelReturned()
+		}, func() {
+			discard()
+			c.metrics.RecordChannelReturned()
+		}), nil
 	}
 
 	return nil, fmt.Errorf("eamqp: no connection available")
-}
-
-// ChannelWithRelease wraps Channel with a release function for pooled channels.
-type ChannelWithRelease struct {
-	Channel
-	release func()
-}
-
-// Close returns the channel to the pool.
-func (c *ChannelWithRelease) Close() error {
-	c.release()
-	if c.Channel.client != nil {
-		if m := c.Channel.client.GetMetrics(); m != nil {
-			m.RecordChannelReturned()
-		}
-	}
-	return nil
 }
 
 // AcquireChannel acquires a channel from the pool (pool mode only).
@@ -269,24 +210,31 @@ func (c *Client) AcquireChannel(ctx context.Context) (*Channel, func(), error) {
 		return nil, nil, fmt.Errorf("eamqp: connection pool not enabled")
 	}
 
-	amqpCh, release, err := c.pool.AcquireChannel(ctx)
+	amqpCh, release, discard, err := c.pool.AcquireFromPool(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	c.metrics.RecordChannelAcquired()
 
-	wrapped := newChannel(amqpCh, c)
-
-	wrappedRelease := func() {
+	wrapped := newChannelWithRelease(amqpCh, c, func() {
 		release()
 		c.metrics.RecordChannelReturned()
+	}, func() {
+		discard()
+		c.metrics.RecordChannelReturned()
+	})
+
+	wrappedRelease := func() {
+		_ = wrapped.Close()
 	}
 
 	return wrapped, wrappedRelease, nil
 }
 
 // NotifyClose returns a channel that receives close notifications.
+// The returned channel must be consumed until it is closed, matching
+// amqp091-go's asynchronous notification contract.
 func (c *Client) NotifyClose() <-chan *Error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -324,15 +272,59 @@ func (c *Client) NotifyClose() <-chan *Error {
 	return ch
 }
 
+// NotifyBlocked returns RabbitMQ connection blocked/unblocked notifications.
+func (c *Client) NotifyBlocked() <-chan amqp.Blocking {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.conn != nil {
+		return c.conn.NotifyBlocked(make(chan amqp.Blocking, 1))
+	}
+	if c.pool != nil {
+		return c.pool.NotifyBlocked()
+	}
+
+	ch := make(chan amqp.Blocking)
+	close(ch)
+	return ch
+}
+
 // Config returns the client configuration.
 func (c *Client) Config() *Config {
 	return c.config
 }
 
+// RawConnection returns the underlying AMQP connection.
+func (c *Client) RawConnection() *amqp.Connection {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.conn != nil {
+		return c.conn
+	}
+	if c.pool != nil {
+		return c.pool.GetConnection(0)
+	}
+	return nil
+}
+
 // Stats returns pool statistics.
 func (c *Client) Stats() PoolStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	if c.pool != nil {
 		return c.pool.Stats()
+	}
+	if c.conn != nil {
+		active := 0
+		if !c.conn.IsClosed() {
+			active = 1
+		}
+		return PoolStats{
+			ConnectionsActive: active,
+			ConnectionsTotal:  1,
+		}
 	}
 	return PoolStats{}
 }
@@ -347,6 +339,10 @@ func (c *Client) GetMetrics() MetricsCollector {
 	return c.metrics
 }
 
+func (c *Client) traceEnabled() bool {
+	return c != nil && c.config != nil && c.config.EnableTraceInterceptor
+}
+
 // Reconnect attempts to reconnect the client.
 func (c *Client) Reconnect() error {
 	c.mu.Lock()
@@ -358,8 +354,15 @@ func (c *Client) Reconnect() error {
 
 	// Close existing connection.
 	if c.conn != nil {
-		c.conn.Close()
-		c.metrics.RecordConnection(false)
+		_ = c.conn.Close()
+		c.conn = nil
+		if c.metrics != nil {
+			c.metrics.RecordConnection(false)
+		}
+	}
+	if c.pool != nil {
+		_ = c.pool.Close()
+		c.pool = nil
 	}
 
 	// Re-dial.
@@ -378,10 +381,14 @@ func WithOptions(opts *Options) Option {
 
 // WithLogger sets a custom logger.
 func WithLogger(log Logger) Option {
-	return func(o *Options) {}
+	return func(o *Options) {
+		o.Logger = log
+	}
 }
 
 // WithMetrics sets a custom metrics collector.
 func WithMetrics(m MetricsCollector) Option {
-	return func(o *Options) {}
+	return func(o *Options) {
+		o.Metrics = m
+	}
 }

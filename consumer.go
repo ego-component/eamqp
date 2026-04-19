@@ -12,11 +12,13 @@ import (
 // MessageHandler is a function that handles a delivery.
 type MessageHandler func(delivery amqp.Delivery) error
 
+const defaultConsumerShutdownTimeout = 5 * time.Second
+
 // Consumer provides high-level message consumption.
 type Consumer struct {
-	channel    *Channel
-	queue      string
-	opts       consumerOptions
+	channel *Channel
+	queue   string
+	opts    consumerOptions
 }
 
 // NewConsumer creates a new consumer.
@@ -114,11 +116,25 @@ func (c *Consumer) ConsumeWithWorkers(ctx context.Context, consumerTag string, n
 	// Wait for context cancellation.
 	<-ctx.Done()
 
-	// Close the channel to stop consuming.
-	c.channel.Cancel(consumerTag, false)
+	cancelErr := c.channel.Cancel(consumerTag, false)
+	closeErr := c.channel.Close()
 
-	wg.Wait()
-	return nil
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(defaultConsumerShutdownTimeout):
+		return fmt.Errorf("eamqp: consumer workers did not stop within %v", defaultConsumerShutdownTimeout)
+	}
+
+	if cancelErr != nil {
+		return cancelErr
+	}
+	return closeErr
 }
 
 // ConsumeWithTimeout starts consuming with per-message timeout.

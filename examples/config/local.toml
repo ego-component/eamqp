@@ -1,0 +1,36 @@
+[amqp.default]
+addr = "amqp://guest:guest@127.0.0.1:5672/"
+vhost = "/"
+heartbeat = "10s"
+poolSize = 1
+channelPoolSize = 1
+enableAccessInterceptor = false
+enableMetricInterceptor = true
+enableTraceInterceptor = true
+clientName = "eamqp-example"
+onFail = "error"
+
+[amqp.pool]
+addr = "amqp://guest:guest@127.0.0.1:5672/,amqp://guest:guest@127.0.0.1:5672/"
+vhost = "/"
+heartbeat = "10s"
+poolSize = 2
+channelPoolSize = 4
+channelPoolMaxIdle = 2
+enableAccessInterceptor = false
+enableMetricInterceptor = true
+enableTraceInterceptor = true
+clientName = "eamqp-pool-example"
+onFail = "error"
+
+[amqp.reconnect]
+addr = "amqp://guest:guest@127.0.0.1:5672/"
+vhost = "/"
+heartbeat = "10s"
+reconnectInterval = "3s"
+reconnectMaxAttempts = 0
+enableAccessInterceptor = false
+enableMetricInterceptor = true
+enableTraceInterceptor = true
+clientName = "eamqp-reconnect-example"
+onFail = "error"

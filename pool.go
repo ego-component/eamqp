@@ -2,7 +2,6 @@ package eamqp
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -18,12 +17,14 @@ type ChannelPool struct {
 	logger Logger
 
 	channels chan *amqp.Channel
-	mu      sync.RWMutex
-	closed  bool
+	permits  chan struct{}
+	mu       sync.RWMutex
+	closed   bool
 
-	acquired  int64
-	returned  int64
-	created   int64
+	acquired int64
+	returned int64
+	created  int64
+	active   int64
 }
 
 // newChannelPool creates a new channel pool.
@@ -35,7 +36,10 @@ func newChannelPool(conn *amqp.Connection, cfg *Config, opts *Options, log Logge
 
 	maxIdle := cfg.ChannelPoolMaxIdle
 	if maxIdle <= 0 {
-		maxIdle = 2
+		maxIdle = poolSize
+	}
+	if maxIdle > poolSize {
+		maxIdle = poolSize
 	}
 
 	return &ChannelPool{
@@ -44,43 +48,73 @@ func newChannelPool(conn *amqp.Connection, cfg *Config, opts *Options, log Logge
 		opts:     opts,
 		logger:   log,
 		channels: make(chan *amqp.Channel, maxIdle),
+		permits:  make(chan struct{}, poolSize),
 	}, nil
 }
 
 // Acquire gets a channel from the pool.
-func (p *ChannelPool) Acquire(ctx context.Context) (*amqp.Channel, func(), error) {
-	if p.closed {
-		return nil, nil, fmt.Errorf("eamqp: channel pool is closed")
+func (p *ChannelPool) Acquire(ctx context.Context) (*amqp.Channel, func(), func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	select {
-	case <-ctx.Done():
-		return nil, nil, ctx.Err()
-	case ch := <-p.channels:
-		if ch != nil && !ch.IsClosed() {
+	for {
+		idle, closed := p.snapshot()
+		if closed {
+			return nil, nil, nil, fmt.Errorf("eamqp: channel pool is closed")
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, ctx.Err()
+		case ch, ok := <-idle:
+			if !ok {
+				return nil, nil, nil, fmt.Errorf("eamqp: channel pool is closed")
+			}
+			if ch != nil && !ch.IsClosed() {
+				atomic.AddInt64(&p.acquired, 1)
+				return ch, func() { p.release(ch) }, func() { p.discard(ch) }, nil
+			}
+			p.releasePermit()
+			continue
+		default:
+		}
+
+		if p.acquirePermit() {
+			ch, err := p.conn.Channel()
+			if err != nil {
+				p.releasePermit()
+				return nil, nil, nil, err
+			}
+
 			atomic.AddInt64(&p.acquired, 1)
-			return ch, func() { p.release(ch) }, nil
+			atomic.AddInt64(&p.created, 1)
+
+			if p.opts != nil && p.opts.ChannelOptions != nil {
+				if err := p.opts.ChannelOptions(ch); err != nil {
+					ch.Close()
+					p.releasePermit()
+					return nil, nil, nil, fmt.Errorf("eamqp: channel options failed: %w", err)
+				}
+			}
+
+			return ch, func() { p.release(ch) }, func() { p.discard(ch) }, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, ctx.Err()
+		case ch, ok := <-idle:
+			if !ok {
+				return nil, nil, nil, fmt.Errorf("eamqp: channel pool is closed")
+			}
+			if ch != nil && !ch.IsClosed() {
+				atomic.AddInt64(&p.acquired, 1)
+				return ch, func() { p.release(ch) }, func() { p.discard(ch) }, nil
+			}
+			p.releasePermit()
 		}
 	}
-
-	// Create a new channel.
-	ch, err := p.conn.Channel()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	atomic.AddInt64(&p.acquired, 1)
-	atomic.AddInt64(&p.created, 1)
-
-	// Apply channel options if set.
-	if p.opts != nil && p.opts.ChannelOptions != nil {
-		if err := p.opts.ChannelOptions(ch); err != nil {
-			ch.Close()
-			return nil, nil, fmt.Errorf("eamqp: channel options failed: %w", err)
-		}
-	}
-
-	return ch, func() { p.release(ch) }, nil
 }
 
 // release returns a channel to the pool.
@@ -89,11 +123,15 @@ func (p *ChannelPool) release(ch *amqp.Channel) {
 	defer p.mu.Unlock()
 
 	if p.closed {
-		ch.Close()
+		if ch != nil {
+			ch.Close()
+		}
+		p.releasePermit()
 		return
 	}
 
-	if ch.IsClosed() {
+	if ch == nil || ch.IsClosed() {
+		p.releasePermit()
 		return
 	}
 
@@ -103,24 +141,40 @@ func (p *ChannelPool) release(ch *amqp.Channel) {
 	default:
 		// Pool is full, close the channel.
 		ch.Close()
+		p.releasePermit()
 	}
+}
+
+// discard closes a leased channel instead of returning it to the idle pool.
+func (p *ChannelPool) discard(ch *amqp.Channel) {
+	if ch != nil {
+		_ = ch.Close()
+	}
+	p.releasePermit()
 }
 
 // Close closes all channels in the pool.
 func (p *ChannelPool) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if p.closed {
+		p.mu.Unlock()
 		return nil
 	}
 
 	p.closed = true
-	if p.channels != nil {
-		close(p.channels)
-		for ch := range p.channels {
-			if err := ch.Close(); err != nil {
-				// Ignore close errors
+	channels := p.channels
+	if channels != nil {
+		close(channels)
+		p.channels = nil
+	}
+	p.mu.Unlock()
+
+	if channels != nil {
+		for ch := range channels {
+			if ch != nil {
+				_ = ch.Close()
+				p.releasePermit()
 			}
 		}
 	}
@@ -131,7 +185,7 @@ func (p *ChannelPool) Close() error {
 // Stats returns pool statistics.
 func (p *ChannelPool) Stats() PoolStats {
 	return PoolStats{
-		ChannelsActive:   len(p.channels),
+		ChannelsActive:   int(atomic.LoadInt64(&p.active)),
 		ChannelsAcquired: atomic.LoadInt64(&p.acquired),
 		ChannelsReturned: atomic.LoadInt64(&p.returned),
 	}
@@ -144,31 +198,69 @@ func (p *ChannelPool) IsClosed() bool {
 	return p.closed
 }
 
+func (p *ChannelPool) snapshot() (chan *amqp.Channel, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.channels, p.closed
+}
+
+func (p *ChannelPool) acquirePermit() bool {
+	if p.permits == nil {
+		atomic.AddInt64(&p.active, 1)
+		return true
+	}
+	select {
+	case p.permits <- struct{}{}:
+		atomic.AddInt64(&p.active, 1)
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *ChannelPool) releasePermit() {
+	if p.permits != nil {
+		select {
+		case <-p.permits:
+		default:
+		}
+	}
+	for {
+		active := atomic.LoadInt64(&p.active)
+		if active <= 0 {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&p.active, active, active-1) {
+			return
+		}
+	}
+}
+
 // ConnectionPool manages multiple AMQP connections for high availability.
 type ConnectionPool struct {
-	config  *Config
-	opts    *Options
-	logger  Logger
-	uris    []amqp.URI
+	config *Config
+	opts   *Options
+	logger Logger
+	uris   []amqp.URI
 
 	mu           sync.RWMutex
 	connections  []*amqp.Connection
 	channelPools []*ChannelPool
 	closed       bool
 
-	current     int32 // Round-robin index
-	total       int64
-	errors      int64
-	reconnects  int64
+	current    int32 // Round-robin index
+	total      int64
+	errors     int64
+	reconnects int64
 }
 
 // newConnectionPool creates a new connection pool.
 func newConnectionPool(cfg *Config, opts *Options, log Logger, uris []amqp.URI) *ConnectionPool {
 	pool := &ConnectionPool{
-		config:   cfg,
-		opts:     opts,
-		logger:   log,
-		uris:    uris,
+		config: cfg,
+		opts:   opts,
+		logger: log,
+		uris:   uris,
 	}
 
 	poolSize := cfg.PoolSize
@@ -190,50 +282,14 @@ func newConnectionPool(cfg *Config, opts *Options, log Logger, uris []amqp.URI) 
 
 // dial connects to an AMQP URI.
 func (p *ConnectionPool) dial(uri amqp.URI) (*amqp.Connection, error) {
-	amqpCfg := amqp.Config{
-		Vhost:      uri.Vhost,
-		Heartbeat:  p.config.Heartbeat,
-		ChannelMax: int(p.config.ChannelMax),
-		FrameSize:  p.config.FrameSize,
-		Locale:     p.config.Locale,
-		Properties: amqp.Table{},
+	amqpCfg, err := p.config.buildAmqpConfig(uri, p.opts)
+	if err != nil {
+		return nil, err
 	}
 
-	if p.config.ClientName != "" {
-		amqpCfg.Properties["connection_name"] = p.config.ClientName
-	}
-
-	// Build TLS config.
-	var tlsConfig *tls.Config
-	if p.config.TLSConfig != nil {
-		tlsConfig = p.config.TLSConfig
-	} else if p.config.TLSCertFile != "" {
-		serverName := p.config.TLSServerName
-		if serverName == "" {
-			serverName = uri.Host
-		}
-		tc, err := p.config.buildTLSConfig(serverName)
-		if err != nil {
-			return nil, err
-		}
-		tlsConfig = tc
-	}
-	amqpCfg.TLSClientConfig = tlsConfig
-
-	// SASL auth.
-	if p.config.Username != "" || p.config.Password != "" {
-		amqpCfg.SASL = []amqp.Authentication{
-			&amqp.PlainAuth{
-				Username: p.config.Username,
-				Password: p.config.Password,
-			},
-		}
-	}
-
-	// Dial with config.
 	conn, err := amqp.DialConfig(uri.String(), amqpCfg)
 	if err != nil {
-		return nil, fmt.Errorf("eamqp: failed to dial %s: %w", uri, err)
+		return nil, fmt.Errorf("eamqp: failed to dial %s: %w", redactAMQPURI(uri.String()), err)
 	}
 
 	return conn, nil
@@ -251,7 +307,7 @@ func (p *ConnectionPool) dialAll() error {
 			for j := 0; j < i; j++ {
 				p.connections[j].Close()
 			}
-			return fmt.Errorf("eamqp: failed to connect to %s: %w", uri, err)
+			return fmt.Errorf("eamqp: failed to connect to %s: %w", redactAMQPURI(uri.String()), err)
 		}
 
 		p.connections[i] = conn
@@ -307,24 +363,24 @@ func (p *ConnectionPool) AcquireChannel(ctx context.Context) (*amqp.Channel, fun
 }
 
 // AcquireFromPool gets a channel from the pool of the next connection.
-func (p *ConnectionPool) AcquireFromPool(ctx context.Context) (*amqp.Channel, func(), error) {
+func (p *ConnectionPool) AcquireFromPool(ctx context.Context) (*amqp.Channel, func(), func(), error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	if p.closed {
-		return nil, nil, fmt.Errorf("eamqp: connection pool is closed")
+		return nil, nil, nil, fmt.Errorf("eamqp: connection pool is closed")
 	}
 
 	n := len(p.channelPools)
 	if n == 0 {
-		return nil, nil, fmt.Errorf("eamqp: no channel pools available")
+		return nil, nil, nil, fmt.Errorf("eamqp: no channel pools available")
 	}
 
 	// Round-robin.
 	idx := int(atomic.AddInt32(&p.current, 1) % int32(n))
 	chanPool := p.channelPools[idx]
 	if chanPool == nil {
-		return nil, nil, fmt.Errorf("eamqp: channel pool %d is not available", idx)
+		return nil, nil, nil, fmt.Errorf("eamqp: channel pool %d is not available", idx)
 	}
 
 	return chanPool.Acquire(ctx)
@@ -333,19 +389,67 @@ func (p *ConnectionPool) AcquireFromPool(ctx context.Context) (*amqp.Channel, fu
 // NotifyClose returns a channel that receives connection close notifications.
 func (p *ConnectionPool) NotifyClose() <-chan *amqp.Error {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
+	connections := append([]*amqp.Connection(nil), p.connections...)
+	p.mu.RUnlock()
 
-	// Return the first connection's notify channel.
-	if len(p.connections) > 0 && p.connections[0] != nil {
-		errChan := make(chan *amqp.Error, 1)
-		p.connections[0].NotifyClose(errChan)
-		return errChan
+	out := make(chan *amqp.Error, len(connections))
+	var wg sync.WaitGroup
+	for _, conn := range connections {
+		if conn == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(conn *amqp.Connection) {
+			defer wg.Done()
+			for err := range conn.NotifyClose(make(chan *amqp.Error, 1)) {
+				out <- err
+			}
+		}(conn)
 	}
 
-	// Return a closed channel if no connection.
-	ch := make(chan *amqp.Error)
-	close(ch)
-	return ch
+	if len(connections) == 0 {
+		close(out)
+		return out
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
+}
+
+// NotifyBlocked returns a channel that receives RabbitMQ blocked notifications.
+func (p *ConnectionPool) NotifyBlocked() <-chan amqp.Blocking {
+	p.mu.RLock()
+	connections := append([]*amqp.Connection(nil), p.connections...)
+	p.mu.RUnlock()
+
+	out := make(chan amqp.Blocking, len(connections))
+	var wg sync.WaitGroup
+	for _, conn := range connections {
+		if conn == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(conn *amqp.Connection) {
+			defer wg.Done()
+			for event := range conn.NotifyBlocked(make(chan amqp.Blocking, 1)) {
+				out <- event
+			}
+		}(conn)
+	}
+
+	if len(connections) == 0 {
+		close(out)
+		return out
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
 }
 
 // Stats returns connection pool statistics.
@@ -359,10 +463,23 @@ func (p *ConnectionPool) Stats() PoolStats {
 			active++
 		}
 	}
+	channelStats := PoolStats{}
+	for _, channelPool := range p.channelPools {
+		if channelPool == nil {
+			continue
+		}
+		stats := channelPool.Stats()
+		channelStats.ChannelsActive += stats.ChannelsActive
+		channelStats.ChannelsAcquired += stats.ChannelsAcquired
+		channelStats.ChannelsReturned += stats.ChannelsReturned
+	}
 
 	return PoolStats{
 		ConnectionsActive: active,
-		ConnectionsTotal:   int(atomic.LoadInt64(&p.total)),
+		ConnectionsTotal:  int(atomic.LoadInt64(&p.total)),
+		ChannelsActive:    channelStats.ChannelsActive,
+		ChannelsAcquired:  channelStats.ChannelsAcquired,
+		ChannelsReturned:  channelStats.ChannelsReturned,
 		Reconnects:        atomic.LoadInt64(&p.reconnects),
 	}
 }
@@ -370,12 +487,24 @@ func (p *ConnectionPool) Stats() PoolStats {
 // Close closes all connections.
 func (p *ConnectionPool) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
 	p.closed = true
+	channelPools := append([]*ChannelPool(nil), p.channelPools...)
+	connections := append([]*amqp.Connection(nil), p.connections...)
+	p.mu.Unlock()
 
 	var lastErr error
-	for _, conn := range p.connections {
+	for _, channelPool := range channelPools {
+		if channelPool != nil {
+			if err := channelPool.Close(); err != nil {
+				lastErr = err
+			}
+		}
+	}
+	for _, conn := range connections {
 		if conn != nil {
 			if err := conn.Close(); err != nil {
 				lastErr = err

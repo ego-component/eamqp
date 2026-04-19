@@ -1,17 +1,21 @@
 # eamqp - RabbitMQ Component for Ego Framework
 
-`eamqp` is a production-ready RabbitMQ client component for the [Ego framework](https://github.com/ego-component/ego). It provides full integration with the official `amqp091-go` library while adhering to Ego's conventions for dependency injection, configuration management, logging, and metrics.
+`eamqp` is a RabbitMQ client component for the [Ego framework](https://github.com/ego-component/ego). It keeps the official `amqp091-go` connection/channel model visible, while adding Ego-style configuration loading and injectable logging/metrics hooks.
+
+See [CAPABILITY_MATRIX.md](./CAPABILITY_MATRIX.md) for the current support matrix and the boundary between the base AMQP wrapper, Ego observability, and future consumer lifecycle work.
 
 ## Features
 
-- Full AMQP 0-9-1 protocol support via `amqp091-go`
-- Connection pooling and channel pooling for high performance
-- Automatic reconnection with exponential backoff
+- AMQP 0-9-1 support via `amqp091-go` thin wrappers and raw accessors
+- Ego config-file loading with `eamqp.Load(...).Build()`
+- Connection pooling and channel pooling
+- Reconnect policy primitives and manual reconnect
 - Publisher confirms for reliable message delivery
 - TLS/SSL support (programmatic and file-based certificates)
 - Multiple URIs for basic load balancing
-- Structured logging with Ego integration
-- Metrics collection for observability
+- Ego `elog`/`emetric` adapters when loaded through `Load(...).Build()`
+- AMQP header trace propagation helpers
+- Lightweight health status and ping checks
 - High-level producer and consumer helpers
 
 ## Installation
@@ -75,6 +79,8 @@ func main() {
 
 ## Configuration
 
+For Ego config-file usage with `eamqp.Load("amqp.default").Build()`, see [CONFIGURATION.md](./CONFIGURATION.md).
+
 ```go
 config := eamqp.Config{
 	// Connection URI(s). Multiple URIs separated by comma enable load balancing.
@@ -103,14 +109,15 @@ config := eamqp.Config{
 	ChannelPoolMaxIdle: 2,
 	ChannelPoolMaxLife: 5 * time.Minute,
 
-	// Reconnection.
-	Reconnect:            true,
+	// Explicit reconnect helper policy. No background topology/consumer
+	// supervisor is started by this component.
 	ReconnectInterval:    5 * time.Second,
-	ReconnectMaxAttempts: 0,  // 0 = infinite
+	ReconnectMaxAttempts: 0,
 
 	// Observability.
-	EnableLogger:  true,
-	EnableMetrics: true,
+	EnableAccessInterceptor: false,
+	EnableMetricInterceptor: true,
+	EnableTraceInterceptor:  true,
 }
 ```
 
@@ -135,6 +142,14 @@ client, err := eamqp.New(eamqp.Config{
 })
 ```
 
+`Channel` wraps the official `amqp091-go` channel. Wrapper methods only protect
+`eamqp` state briefly; AMQP operation serialization is delegated to
+`amqp091-go`. If you use `RawChannel()`, keep the official rule: a raw channel
+is not safe to share across goroutines without your own synchronization. Pooled
+channels that enter stateful modes such as confirm, QoS, transactions,
+consumption, notify listeners, or raw access are closed on `Close()` instead of
+being returned to the idle pool.
+
 ## Publisher Confirms
 
 ```go
@@ -144,6 +159,7 @@ if err := ch.Confirm(false); err != nil {
 }
 
 confirms := ch.NotifyPublish()
+// Always consume NotifyPublish/NotifyClose style channels until they close.
 
 // Publish with confirmation.
 err = ch.Publish("exchange", "key", false, false, amqp.Publishing{
@@ -244,6 +260,11 @@ if err != nil {
 
 ## Logging and Metrics
 
+`Load(...).Build()` injects Ego `elog`, `emetric`, and trace adapters according
+to `enableAccessInterceptor`, `enableMetricInterceptor`, and
+`enableTraceInterceptor`. Direct `New(...)` usage can inject custom hooks
+explicitly:
+
 ```go
 // Implement the Logger interface.
 type MyLogger struct{}
@@ -266,14 +287,134 @@ client, err := eamqp.New(cfg,
 )
 ```
 
+## Trace Headers
+
+`PublishWithContext` injects the active Ego/OpenTelemetry trace context into
+AMQP headers when a global Ego tracer is registered. With amqp091-go v1.9.0,
+the context should not be treated as a guaranteed publish timeout or
+cancellation mechanism. Consumer code can extract the context explicitly from a
+delivery:
+
+```go
+ctx = eamqp.ExtractTraceContext(ctx, delivery.Headers)
+```
+
+For custom publishing paths, use:
+
+```go
+msg.Headers = eamqp.InjectTraceHeaders(ctx, msg.Headers)
+```
+
+## Health Checks
+
+`HealthStatus()` is a lightweight in-memory check based on the current
+connection or connection pool state. `Ping(ctx)` opens and closes an AMQP
+channel, so use it when readiness must prove that RabbitMQ is accepting channel
+operations:
+
+```go
+if err := client.Ping(ctx); err != nil {
+	return err
+}
+
+health := client.HealthStatus()
+if !client.Health() {
+	log.Printf("amqp unhealthy: %s", health.Reason)
+}
+```
+
+RabbitMQ blocked/unblocked events are still exposed separately through
+`NotifyBlocked()`. `Reconnect()` is explicit; this component does not silently
+rebuild channels, consumers, or topology in the background.
+
+## Raw AMQP Access
+
+The wrapper exposes raw accessors so uncommon `amqp091-go` features are not
+blocked by `eamqp`:
+
+```go
+conn := client.RawConnection()
+rawCh := ch.RawChannel()
+```
+
 ## Examples
 
-See the `examples/` directory for complete examples:
+Examples use Ego-style config loading through `eamqp.Load(...).Build()`. Start
+RabbitMQ locally, then run examples with the provided config file:
+
+```bash
+go run ./examples/producer --config=examples/config/local.toml
+go run ./examples/consumer --config=examples/config/local.toml
+go run ./examples/pubsub --config=examples/config/local.toml
+go run ./examples/connection-pool --config=examples/config/local.toml
+go run ./examples/producer-confirm --config=examples/config/local.toml
+go run ./examples/batch-producer --config=examples/config/local.toml
+go run ./examples/transaction --config=examples/config/local.toml
+go run ./examples/workqueue-publisher --config=examples/config/local.toml
+go run ./examples/workqueue-worker --config=examples/config/local.toml
+go run ./examples/rpc --config=examples/config/local.toml
+go run ./examples/qos --config=examples/config/local.toml publish
+go run ./examples/qos --config=examples/config/local.toml inspect
+go run ./examples/dead-letter --config=examples/config/local.toml publisher
+go run ./examples/dead-letter --config=examples/config/local.toml inspect-dlq
+go run ./examples/retry-consumer-sender --config=examples/config/local.toml
+go run ./examples/pubsub-fanout --config=examples/config/local.toml publish
+go run ./examples/reconnect --config=examples/config/local.toml producer
+```
+
+The example helper also checks `EAMQP_EXAMPLE_CONFIG` and, when running from the
+repository root, falls back to `examples/config/local.toml`. Role-based examples
+strip `--config` before parsing their own arguments, so either
+`--config=examples/config/local.toml publish` or
+`publish --config=examples/config/local.toml` works.
 
 - `examples/pubsub` - Publish/subscribe pattern
-- `examples/producer` - Publisher confirms
-- `examples/consumer` - Message consumption
+- `examples/producer` / `examples/consumer` - Paired direct exchange example
+- `examples/producer-confirm` - High-level producer confirms
+- `examples/batch-producer` - Batch helper with publisher confirms
+- `examples/connection-pool` - Configured connection pool
+- `examples/transaction` - AMQP transactions
+- `examples/workqueue-publisher` / `examples/workqueue-worker` - Work queue pattern
 - `examples/rpc` - RPC-style communication
+- `examples/qos` - Consumer prefetch and queue inspection
+- `examples/dead-letter` - DLX and DLQ handling
+- `examples/retry-consumer-listener` / `examples/retry-consumer-sender` - Retry pattern
+- `examples/pubsub-fanout` - Fanout broadcast publish/subscribe
+- `examples/reconnect` - Close notifications and explicit reconnect boundary
+
+## Roadmap
+
+### v0.1.0
+
+Initial production candidate:
+
+- Ego-style config loading with `Load(...).Build()` and `BuildE()`
+- Configurable connection, channel pool, TLS, logging, metrics, and trace options
+- Thin AMQP wrappers with raw access to `amqp091-go`
+- Publisher confirms, QoS, transactions, dead-letter, RPC, pub/sub, and work queue examples
+- Health checks, ping, pool stats, and `/debug/amqp/stats`
+- Explicit reconnect boundary without automatic topology or consumer recovery
+
+### v0.2.0
+
+Consumer lifecycle hardening:
+
+- Consumer supervisor helper for common worker patterns
+- Graceful shutdown, handler panic recovery, and structured ack/nack handling
+- Consumer metrics for deliveries, ack/nack/reject, handler errors, and processing latency
+- Reconnect template that rebuilds connection, channel, topology, QoS, and consumers in application code
+- Separate producer and consumer connection examples for RabbitMQ TCP pushback isolation
+- `CONSUMER_GUIDE.md` with production consumption patterns
+
+### v0.3.0
+
+Advanced operational helpers:
+
+- Optional topology declaration helper for applications that want a repeatable bootstrap step
+- Batch publisher confirm helper with explicit nack and retry hooks
+- RabbitMQ blocked/unblocked event handling examples
+- Refined metric labels and dashboard guidance
+- Compatibility review for newer `amqp091-go` releases
 
 ## Architecture
 

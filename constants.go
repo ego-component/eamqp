@@ -20,17 +20,17 @@ const (
 // Queue argument keys.
 const (
 	QueueTypeArg                 = "x-queue-type"
-	QueueMaxLenArg              = "x-max-length"
-	QueueMaxLenBytesArg         = "x-max-length-bytes"
-	QueueOverflowArg            = "x-overflow"
-	QueueMessageTTLArg         = "x-message-ttl"
-	QueueTTLArg                = "x-expires"
-	StreamMaxAgeArg            = "x-max-age"
+	QueueMaxLenArg               = "x-max-length"
+	QueueMaxLenBytesArg          = "x-max-length-bytes"
+	QueueOverflowArg             = "x-overflow"
+	QueueMessageTTLArg           = "x-message-ttl"
+	QueueTTLArg                  = "x-expires"
+	StreamMaxAgeArg              = "x-max-age"
 	StreamMaxSegmentSizeBytesArg = "x-stream-max-segment-size-bytes"
-	QueueVersionArg            = "x-queue-version"
-	ConsumerTimeoutArg         = "x-consumer-timeout"
-	SingleActiveConsumerArg    = "x-single-active-consumer"
-	QueueExclusiveArg         = "x-exclusive"
+	QueueVersionArg              = "x-queue-version"
+	ConsumerTimeoutArg           = "x-consumer-timeout"
+	SingleActiveConsumerArg      = "x-single-active-consumer"
+	QueueExclusiveArg            = "x-exclusive"
 )
 
 // Queue type values.
@@ -53,5 +53,8 @@ const (
 	ImmediatelyExpire = "0"
 )
 
-// ComponentName is the component identifier for ego.
+// PackageName is the component identifier used by Ego logging and metrics.
+const PackageName = "component.eamqp"
+
+// ComponentName is kept as a short component type label for AMQP metrics.
 const ComponentName = "eamqp"

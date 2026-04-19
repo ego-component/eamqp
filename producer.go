@@ -11,15 +11,18 @@ import (
 
 // Producer provides high-level publishing with confirms support.
 type Producer struct {
-	channel   *Channel
-	confirms  <-chan amqp.Confirmation
-	mu        sync.Mutex
-	enabled   bool
-	timeout   time.Duration
+	channel *Channel
+	mu      sync.Mutex
+	enabled bool
+	timeout time.Duration
 }
 
 // NewProducer creates a new producer.
 func NewProducer(ch *Channel, opts ...ProducerOption) (*Producer, error) {
+	if ch == nil {
+		return nil, fmt.Errorf("eamqp: producer channel is nil")
+	}
+
 	p := &Producer{
 		channel: ch,
 		enabled: false,
@@ -34,7 +37,6 @@ func NewProducer(ch *Channel, opts ...ProducerOption) (*Producer, error) {
 		if err := p.channel.Confirm(false); err != nil {
 			return nil, err
 		}
-		p.confirms = p.channel.NotifyPublish()
 	}
 
 	return p, nil
@@ -58,20 +60,33 @@ func (p *Producer) Publish(exchange, routingKey string, msg amqp.Publishing) err
 
 // PublishWithOptions publishes a message with full control.
 func (p *Producer) PublishWithOptions(exchange, routingKey string, mandatory, immediate bool, msg amqp.Publishing) error {
-	if err := p.channel.Publish(exchange, routingKey, mandatory, immediate, msg); err != nil {
+	if err := p.validateChannel(); err != nil {
 		return err
 	}
 
-	// Wait for confirm if enabled.
-	if p.enabled {
-		return p.waitForConfirm()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.enabled {
+		return p.channel.Publish(exchange, routingKey, mandatory, immediate, msg)
 	}
 
-	return nil
+	confirmation, err := p.channel.PublishWithDeferredConfirm(exchange, routingKey, mandatory, immediate, msg)
+	if err != nil {
+		return err
+	}
+	return p.waitForDeferredConfirm(context.Background(), confirmation)
 }
 
 // PublishAsync publishes without waiting for confirm.
 func (p *Producer) PublishAsync(exchange, routingKey string, msg amqp.Publishing) (*amqp.DeferredConfirmation, error) {
+	if err := p.validateChannel(); err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	return p.channel.PublishWithDeferredConfirm(exchange, routingKey, false, false, msg)
 }
 
@@ -82,65 +97,100 @@ func (p *Producer) PublishWithContext(ctx context.Context, exchange, routingKey 
 
 // PublishWithContextOptions publishes with context and full options.
 func (p *Producer) PublishWithContextOptions(ctx context.Context, exchange, routingKey string, mandatory, immediate bool, msg amqp.Publishing) error {
-	if err := p.channel.PublishWithContext(ctx, exchange, routingKey, mandatory, immediate, msg); err != nil {
+	if err := p.validateChannel(); err != nil {
 		return err
 	}
 
-	// Wait for confirm if enabled.
-	if p.enabled {
-		return p.waitForConfirmWithContext(ctx)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.enabled {
+		return p.channel.PublishWithContext(ctx, exchange, routingKey, mandatory, immediate, msg)
 	}
 
-	return nil
-}
-
-// waitForConfirm waits for a publish confirmation.
-func (p *Producer) waitForConfirm() error {
-	select {
-	case confirm, ok := <-p.confirms:
-		if !ok {
-			return fmt.Errorf("eamqp: confirm channel closed")
-		}
-		if !confirm.Ack {
-			return fmt.Errorf("eamqp: message not acknowledged (tag=%d)", confirm.DeliveryTag)
-		}
-	case <-time.After(p.timeout):
-		return fmt.Errorf("eamqp: confirm timeout after %v", p.timeout)
+	confirmation, err := p.channel.PublishWithDeferredConfirmWithContext(ctx, exchange, routingKey, mandatory, immediate, msg)
+	if err != nil {
+		return err
 	}
-	return nil
+	return p.waitForDeferredConfirm(ctx, confirmation)
 }
 
-// waitForConfirmWithContext waits for a publish confirmation with context.
-func (p *Producer) waitForConfirmWithContext(ctx context.Context) error {
+// waitForDeferredConfirm waits for a publish confirmation without registering a NotifyPublish listener.
+func (p *Producer) waitForDeferredConfirm(ctx context.Context, confirmation *amqp.DeferredConfirmation) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if confirmation == nil {
+		return fmt.Errorf("eamqp: deferred confirmation is nil")
+	}
+
+	timer := time.NewTimer(p.timeout)
+	defer timer.Stop()
+
 	select {
-	case confirm, ok := <-p.confirms:
-		if !ok {
-			return fmt.Errorf("eamqp: confirm channel closed")
-		}
-		if !confirm.Ack {
-			return fmt.Errorf("eamqp: message not acknowledged")
-		}
+	case <-confirmation.Done():
+		return p.recordConfirmation(confirmation.Acked(), confirmation.DeliveryTag)
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(p.timeout):
+	case <-timer.C:
 		return fmt.Errorf("eamqp: confirm timeout after %v", p.timeout)
 	}
+}
+
+func (p *Producer) recordConfirmation(ack bool, deliveryTag uint64) error {
+	if !ack {
+		p.recordMessageNacked()
+		return fmt.Errorf("eamqp: message not acknowledged (tag=%d)", deliveryTag)
+	}
+	p.recordMessageConfirmed()
 	return nil
 }
 
 // Close closes the producer's channel.
 func (p *Producer) Close() error {
+	if err := p.validateChannel(); err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	return p.channel.Close()
+}
+
+func (p *Producer) validateChannel() error {
+	if p == nil || p.channel == nil {
+		return fmt.Errorf("eamqp: producer channel is nil")
+	}
+	return nil
+}
+
+func (p *Producer) recordMessageConfirmed() {
+	if p.channel == nil || p.channel.client == nil {
+		return
+	}
+	if metrics := p.channel.client.GetMetrics(); metrics != nil {
+		metrics.RecordMessageConfirmed()
+	}
+}
+
+func (p *Producer) recordMessageNacked() {
+	if p.channel == nil || p.channel.client == nil {
+		return
+	}
+	if metrics := p.channel.client.GetMetrics(); metrics != nil {
+		metrics.RecordMessageNacked()
+	}
 }
 
 // BatchProducer provides batch publishing support.
 type BatchProducer struct {
 	producer   *Producer
-	batch     []amqp.Publishing
-	exchange  string
+	batch      []amqp.Publishing
+	exchange   string
 	routingKey string
-	maxSize   int
-	mu        sync.Mutex
+	maxSize    int
+	mu         sync.Mutex
 }
 
 // NewBatchProducer creates a batch producer.

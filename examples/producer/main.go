@@ -4,18 +4,14 @@ package main
 import (
 	"fmt"
 	"log"
-	"os"
 	"time"
 
-	"github.com/ego-component/eamqp"
+	"github.com/ego-component/eamqp/examples/internal/exampleconfig"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 func main() {
-	// Create client.
-	client, err := eamqp.New(eamqp.Config{
-		Addr: getAddr(),
-	})
+	client, err := exampleconfig.LoadClient(exampleconfig.DefaultComponentKey)
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
@@ -62,8 +58,8 @@ func main() {
 		err := ch.Publish(exchange, routingKey, false, false, amqp.Publishing{
 			ContentType:  "application/json",
 			DeliveryMode: amqp.Persistent,
-			Body:        []byte(body),
-			Timestamp:   time.Now(),
+			Body:         []byte(body),
+			Timestamp:    time.Now(),
 		})
 		if err != nil {
 			log.Printf("Failed to publish: %v", err)
@@ -84,11 +80,4 @@ func main() {
 	}
 
 	fmt.Println("Done")
-}
-
-func getAddr() string {
-	if addr := os.Getenv("AMQP_ADDR"); addr != "" {
-		return addr
-	}
-	return "amqp://guest:guest@localhost:5672/"
 }

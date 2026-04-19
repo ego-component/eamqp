@@ -112,8 +112,8 @@ func WithConsumerArgs(args amqp.Table) ConsumerOption {
 type PoolStats struct {
 	ConnectionsActive int
 	ConnectionsTotal int
-	ChannelsActive   int
+	ChannelsActive    int
 	ChannelsAcquired int64
 	ChannelsReturned int64
-	Reconnects      int64
+	Reconnects       int64
 }

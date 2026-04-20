@@ -17,9 +17,11 @@ type ChannelPool struct {
 	logger Logger
 
 	channels chan *amqp.Channel
-	permits  chan struct{}
-	mu       sync.RWMutex
-	closed   bool
+	// permits is a reverse semaphore: acquire sends a token, release receives
+	// one. A full buffer means the pool has reached its active channel limit.
+	permits chan struct{}
+	mu      sync.RWMutex
+	closed  bool
 
 	acquired int64
 	returned int64

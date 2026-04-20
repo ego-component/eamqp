@@ -46,8 +46,8 @@ func (p ReconnectPolicy) Backoff(attempt int) time.Duration {
 
 // reconnectManager manages the reconnection lifecycle.
 type reconnectManager struct {
-	policy        ReconnectPolicy
-	attempt       int32
+	policy       ReconnectPolicy
+	attempt      int32
 	onReconnect  func(attempt int)
 	onDisconnect func(err error)
 	logger       Logger
@@ -56,11 +56,11 @@ type reconnectManager struct {
 // newReconnectManager creates a new reconnect manager.
 func newReconnectManager(policy ReconnectPolicy, opts *Options, log Logger) *reconnectManager {
 	rm := &reconnectManager{
-		policy:        policy,
-		attempt:       -1,
-		onReconnect:   func(int) {},
+		policy:       policy,
+		attempt:      -1,
+		onReconnect:  func(int) {},
 		onDisconnect: func(error) {},
-		logger:        log,
+		logger:       log,
 	}
 
 	if opts != nil {

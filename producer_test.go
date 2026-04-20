@@ -72,6 +72,18 @@ func TestNewProducerRejectsNilChannel(t *testing.T) {
 	assert.Contains(t, err.Error(), "channel is nil")
 }
 
+func TestNewBatchProducerRejectsNonPositiveMaxSize(t *testing.T) {
+	for _, maxSize := range []int{0, -1} {
+		t.Run(fmt.Sprintf("maxSize=%d", maxSize), func(t *testing.T) {
+			producer, err := NewBatchProducer(&Channel{}, "exchange", "routing-key", maxSize)
+
+			require.Error(t, err)
+			assert.Nil(t, producer)
+			assert.Contains(t, err.Error(), "maxSize must be > 0")
+		})
+	}
+}
+
 func TestProducerCloseRejectsNilChannel(t *testing.T) {
 	producer := &Producer{}
 

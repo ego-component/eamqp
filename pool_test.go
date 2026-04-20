@@ -12,11 +12,11 @@ import (
 func TestPoolStats(t *testing.T) {
 	stats := PoolStats{
 		ConnectionsActive: 1,
-		ConnectionsTotal:   5,
-		ChannelsActive:     2,
-		ChannelsAcquired:   100,
-		ChannelsReturned:   95,
-		Reconnects:         3,
+		ConnectionsTotal:  5,
+		ChannelsActive:    2,
+		ChannelsAcquired:  100,
+		ChannelsReturned:  95,
+		Reconnects:        3,
 	}
 
 	assert.Equal(t, 1, stats.ConnectionsActive)
@@ -37,6 +37,23 @@ func TestChannelPoolClose(t *testing.T) {
 	err := pool.Close()
 	assert.NoError(t, err)
 	assert.True(t, pool.IsClosed())
+}
+
+func TestChannelPoolPermitsLimitActiveLeases(t *testing.T) {
+	pool := &ChannelPool{
+		permits: make(chan struct{}, 2),
+	}
+
+	assert.True(t, pool.acquirePermit())
+	assert.True(t, pool.acquirePermit())
+	assert.False(t, pool.acquirePermit())
+	assert.Equal(t, 2, pool.Stats().ChannelsActive)
+
+	pool.releasePermit()
+
+	assert.Equal(t, 1, pool.Stats().ChannelsActive)
+	assert.True(t, pool.acquirePermit())
+	assert.Equal(t, 2, pool.Stats().ChannelsActive)
 }
 
 func TestConnectionPoolClose(t *testing.T) {

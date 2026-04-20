@@ -195,6 +195,10 @@ type BatchProducer struct {
 
 // NewBatchProducer creates a batch producer.
 func NewBatchProducer(ch *Channel, exchange, routingKey string, maxSize int, opts ...ProducerOption) (*BatchProducer, error) {
+	if maxSize <= 0 {
+		return nil, fmt.Errorf("eamqp: maxSize must be > 0, got %d", maxSize)
+	}
+
 	producer, err := NewProducer(ch, opts...)
 	if err != nil {
 		return nil, err
@@ -210,6 +214,8 @@ func NewBatchProducer(ch *Channel, exchange, routingKey string, maxSize int, opt
 }
 
 // Add adds a message to the batch.
+// It does not block or fail when the batch reaches maxSize; callers should use
+// ShouldFlush after Add and call Flush when it returns true.
 func (bp *BatchProducer) Add(msg amqp.Publishing) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()

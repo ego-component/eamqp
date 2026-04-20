@@ -91,6 +91,9 @@ func DeclarePubSub(ch *Channel, exchange string) (amqp.Queue, error) {
 }
 
 // SimpleRPC performs a simple RPC-style request/response.
+// It is a lightweight helper: the reply is acknowledged before the response
+// body is returned, so callers that need acknowledgement control should build
+// on Channel.Consume directly or use a higher-level RPC abstraction.
 func SimpleRPC(client *Client, exchange, routingKey, replyTo string, body []byte, timeout time.Duration) ([]byte, error) {
 	ch, err := client.NewChannel()
 	if err != nil {
@@ -99,7 +102,7 @@ func SimpleRPC(client *Client, exchange, routingKey, replyTo string, body []byte
 	defer ch.Close()
 
 	// Set up consumer first.
-	deliveries, err := ch.Consume(replyTo, "", true, false, false, false, nil)
+	deliveries, err := ch.Consume(replyTo, "", false, false, false, false, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +120,13 @@ func SimpleRPC(client *Client, exchange, routingKey, replyTo string, body []byte
 
 	// Wait for response.
 	select {
-	case delivery := <-deliveries:
+	case delivery, ok := <-deliveries:
+		if !ok {
+			return nil, fmt.Errorf("eamqp: RPC reply consumer closed")
+		}
+		if err := delivery.Ack(false); err != nil {
+			return nil, fmt.Errorf("eamqp: RPC reply ack failed: %w", err)
+		}
 		return delivery.Body, nil
 	case <-time.After(timeout):
 		return nil, fmt.Errorf("eamqp: RPC timeout after %v", timeout)

@@ -3,6 +3,7 @@ package eamqp
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -111,4 +112,19 @@ func TestContextAndNotifyDocsStateOperationalBoundaries(t *testing.T) {
 	assert.Contains(t, channelSource, "does not guarantee publish timeout or cancellation")
 	assert.Contains(t, channelSource, "The returned channel must be consumed")
 	assert.Contains(t, clientSource, "The returned channel must be consumed")
+}
+
+func TestREADMEQuickStartImportsAMQP(t *testing.T) {
+	data, err := os.ReadFile("README.md")
+	require.NoError(t, err)
+	source := string(data)
+
+	start := strings.Index(source, "## Quick Start")
+	require.NotEqual(t, -1, start)
+	end := strings.Index(source[start:], "## Configuration")
+	require.NotEqual(t, -1, end)
+	quickStart := source[start : start+end]
+
+	assert.Contains(t, quickStart, `amqp "github.com/rabbitmq/amqp091-go"`)
+	assert.Contains(t, quickStart, "amqp.Publishing")
 }

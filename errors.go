@@ -8,9 +8,9 @@ import (
 
 // Error wraps amqp.Error with component context.
 type Error struct {
-	amqpErr *amqp.Error
+	amqpErr   *amqp.Error
 	Component string // "connection", "channel", "publish", "consume"
-	Op       string // Operation name
+	Op        string // Operation name
 }
 
 // Error implements error.
@@ -43,6 +43,6 @@ func wrapError(err *amqp.Error, component, op string) *Error {
 	return &Error{
 		amqpErr:   err,
 		Component: component,
-		Op:       op,
+		Op:        op,
 	}
 }

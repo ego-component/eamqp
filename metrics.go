@@ -21,13 +21,13 @@ type MetricsCollector interface {
 // NoOpMetrics is a no-op metrics collector.
 type NoOpMetrics struct{}
 
-func (m *NoOpMetrics) RecordConnection(active bool)                          {}
-func (m *NoOpMetrics) RecordConnectionError()                              {}
-func (m *NoOpMetrics) RecordChannelAcquired()                              {}
-func (m *NoOpMetrics) RecordChannelReturned()                             {}
-func (m *NoOpMetrics) RecordMessagePublished(size int)                      {}
-func (m *NoOpMetrics) RecordMessageConfirmed()                             {}
-func (m *NoOpMetrics) RecordMessageNacked()                                {}
-func (m *NoOpMetrics) RecordMessageConsumed(size int)                      {}
-func (m *NoOpMetrics) RecordPublishLatency(duration time.Duration)          {}
-func (m *NoOpMetrics) RecordConsumeLatency(duration time.Duration)        {}
+func (m *NoOpMetrics) RecordConnection(active bool)                {}
+func (m *NoOpMetrics) RecordConnectionError()                      {}
+func (m *NoOpMetrics) RecordChannelAcquired()                      {}
+func (m *NoOpMetrics) RecordChannelReturned()                      {}
+func (m *NoOpMetrics) RecordMessagePublished(size int)             {}
+func (m *NoOpMetrics) RecordMessageConfirmed()                     {}
+func (m *NoOpMetrics) RecordMessageNacked()                        {}
+func (m *NoOpMetrics) RecordMessageConsumed(size int)              {}
+func (m *NoOpMetrics) RecordPublishLatency(duration time.Duration) {}
+func (m *NoOpMetrics) RecordConsumeLatency(duration time.Duration) {}

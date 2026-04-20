@@ -15,6 +15,10 @@ func NewQueueArgs() QueueArgs {
 }
 
 // WithDurable sets the durable argument.
+//
+// Deprecated: durable is a QueueDeclare parameter, not a queue argument. Use
+// QueueDeclare's durable parameter directly. Use WithQueueType to set
+// x-queue-type explicitly.
 func (a QueueArgs) WithDurable(durable bool) QueueArgs {
 	if durable {
 		a["x-queue-type"] = QueueTypeClassic
@@ -111,9 +115,9 @@ func WithConsumerArgs(args amqp.Table) ConsumerOption {
 // PoolStats holds connection/channel pool statistics.
 type PoolStats struct {
 	ConnectionsActive int
-	ConnectionsTotal int
+	ConnectionsTotal  int
 	ChannelsActive    int
-	ChannelsAcquired int64
-	ChannelsReturned int64
-	Reconnects       int64
+	ChannelsAcquired  int64
+	ChannelsReturned  int64
+	Reconnects        int64
 }
